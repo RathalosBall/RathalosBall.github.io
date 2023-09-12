@@ -1,0 +1,1143 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+
+        <title>Mastodon Cacher</title>
+
+        <link rel="stylesheet" href="https://pyscript.net/latest/pyscript.css" />
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.1/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-4bw+/aepP/YC94hEpVNVgiZdgIC5+VKNBQNGCHeKRQN+PtmoHDEXuppvnDJzQIu9" crossorigin="anonymous">
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
+        <script defer src="https://pyscript.net/latest/pyscript.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.11.8/dist/umd/popper.min.js" integrity="sha384-I7E8VVD/ismYTF4hNIPjVp/Zjvgyol6VFvRkX/vR+Vc4jQkC+hVqc2pM8ODewa9r" crossorigin="anonymous"></script>
+        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.1/dist/js/bootstrap.min.js" integrity="sha384-Rx+T1VzGupg4BHQYs2gCW9It+akI2MM/mndMCy36UVfodzcJcF0GGLxZIzObiEfa" crossorigin="anonymous"></script>
+        <style>
+            html, body {
+                height: 100%;
+                width: 100%;
+            }
+            .container, .item {
+              display: inline-block;
+              box-sizing: border-box;
+            }
+            
+            .container {
+              width: 100%;
+              height: 100%;
+              border: 2px solid #ddd;
+            }
+            
+            .item {
+              width: 100%;
+              text-align: center;
+              padding: 5px;
+              border: 1px solid #ddd;
+            }
+        </style>
+    </head>
+    <body>
+      <py-config>
+        packages = ["requests", "pyodide-http", "beautifulsoup4"]
+      </py-config>
+      <script>
+          function FS_syncfs(populate) {
+              return new Promise((resolve, reject) => {
+                  navigator.locks.request("FS_syncfs", (lock) => {
+                      pyscript.interpreter.interface.FS.syncfs(populate, (errorResponse) => {
+                          if (errorResponse) {
+                              alert(`Error: ${error}, stack: ${error.stack}`);
+                              reject(errorResponse);
+                          }
+                          resolve(errorResponse);
+                      });
+                  });
+              });
+          }
+
+          mountDir = "/persist";
+
+          async function setup_persist_storage() {
+              const { FS, runPython } = await globalThis.loadPyodide();
+              var psFS = pyscript.interpreter.interface.FS
+
+              // mount the IDBFS folder
+              if (!psFS.analyzePath(mountDir, false).exists) {
+                  psFS.mkdir(mountDir);
+              }
+              psFS.mount(psFS.filesystems.IDBFS, { root: "." }, mountDir);
+              await FS_syncfs(true);
+              pyscript.interpreter.interface.runPython(`
+                  import sys
+                  sys.path.append("${mountDir}")
+              `)
+          }
+
+          // import { loadPyodide } from 'https://cdn.jsdelivr.net/pyodide/v0.23.4/full/pyodide.mjs';
+          // import plainTag from 'https://esm.sh/plain-tag';
+          // const py = (...args) => runPython(plainTag(...args));
+          // py`import sys;sys.path.append("${mountDir}")`;
+      </script>
+
+      
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      <py-script>
+        import os
+        import sys
+        import glob
+        import re
+        import subprocess
+        import json
+        import requests
+        import copy
+        import math
+        import functools
+        import traceback
+        import pyodide_http
+        from pyscript import when
+        from js import alert, navigator, localStorage, window, URL, bootstrap, mountDir as mount_dir
+        assert not mount_dir.endswith("/")
+        import pyodide.code
+        from pyodide.ffi.wrappers import add_event_listener
+        from pyodide.ffi import create_proxy, JsException
+        import asyncio
+        import urllib.parse
+        from bs4 import BeautifulSoup
+        import time
+        from pathlib import Path
+        from threading import RLock
+        import collections
+
+        class Storage():
+            ready = False
+            EXT = ".json"
+            cache = {}
+            _task_set = None
+            sync_lock = RLock()
+            cache_lock = RLock()
+            local_lock = collections.defaultdict(RLock)
+
+            @classmethod
+            def check_size(cls):
+                try:
+                    root_directory = Path(mount_dir)
+                    return sum(f.stat().st_size for f in root_directory.glob('**/*') if f.is_file())
+                except Exception:
+                    pass
+                return None
+
+            @classmethod
+            def syncfs(cls, *, fetch=False, push=False):
+                if not cls.ready:
+                    return False
+                fetch, push = bool(fetch), bool(push)
+                assert fetch != push, "Only specify one of fetch or push"
+                with cls.sync_lock:
+                    if fetch:
+                        return js.FS_syncfs(True)
+                    assert push
+                    return js.FS_syncfs(False)
+
+            @classmethod
+            async def setup_persist_storage(cls):
+                try:
+                    print("setting up storage")
+                    await js.setup_persist_storage()
+                    print("storage is ready")
+                    cls.ready = True
+                    print(f"listdir of {mount_dir}:")
+                    for d in os.listdir(mount_dir):
+                        print(d, ":")
+                        print(os.listdir(f"{mount_dir}/{d}"))
+                    print(f"Total size: {cls.check_size()}")
+                except JsException as ex:
+                    traceback.print_exception(type(ex), ex, ex.__traceback__)
+                    print(ex.stack)
+                    raise ex
+                except Exception as ex:
+                    traceback.print_exception(type(ex), ex, ex.__traceback__)
+                    raise ex
+
+            @classmethod
+            def get(cls, field, default=None):
+                with cls.cache_lock:
+                    if field in cls.cache:
+                        return cls.cache[field]
+                if not cls.ready:
+                    return default
+                path = os.path.join(mount_dir, field) + cls.EXT
+                if not os.path.exists(path):
+                    return default
+                with cls.local_lock[path]:
+                    with open(path, "rt") as f:
+                        return json.load(f)
+
+            @classmethod
+            def set(cls, field, newval):
+                with cls.cache_lock:
+                    cls.cache[field] = newval
+                if not cls.ready:
+                    return
+                path = os.path.join(mount_dir, field) + cls.EXT
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                cls._task_set = asyncio.create_task(cls.wait_and_set(path, newval))
+
+            @classmethod
+            async def wait_and_set(cls, path, newval, delay=10):
+                time_save_requested = time.time()
+                cls.time_save_requested = time_save_requested
+                await asyncio.sleep(delay)
+                if cls.time_save_requested == time_save_requested:
+                    # no change during the wait, save it.
+                    print("Writing to file...")
+                    with cls.local_lock[path]:
+                        with open(path, "wt") as f:
+                            json.dump(newval, f)
+                    await asyncio.ensure_future(cls.syncfs(push=True))
+                    print("File written and syncfs complete.")
+
+            _task_setup = None
+
+
+        Storage._task_setup = asyncio.create_task(Storage.setup_persist_storage())
+
+        # Patch the Requests library so it works with Pyscript
+        pyodide_http.patch_all()
+
+        class DisplayHTMLfromHTML():
+            def __init__(self, html):
+                self.html = html
+
+            def _repr_html_(self):
+                return self.html
+
+
+        class FromJSON():
+            SEP = "\n"
+            VERBOSE = True
+
+            def __init__(self, content):
+                self._c = content
+
+            @property
+            def text_dict(self):
+                return dict()
+
+            @property
+            def text_list(self):
+                if self.VERBOSE:
+                    return list(f"{k}: {v}" for k, v in self.text_dict.items() if v)
+                return list(v for v in self.text_dict.values() if v)
+
+            @property
+            def text_only(self):
+                return self.SEP.join(self.text_list)
+
+            @property
+            def soup(self):
+                if not hasattr(self, "_soup") or self._soup is None:
+                    return None
+                if isinstance(self._soup, str):
+                    self._soup = BeautifulSoup(self._soup, 'html.parser')
+                return self._soup
+
+            @soup.setter
+            def soup(self, v):
+                self._soup = v
+
+
+        class PreviewCard(FromJSON):
+            def __init__(self, content):
+                super().__init__(content)
+                if self._c:
+                    self.soup = self._c.get("html", "")
+
+            @property
+            def text_dict(self):
+                if not self._c:
+                    return dict()
+                result = {k: self._c.get(k, "") for k in ["title", "description", "author_name", "provider_name", ]}
+                result = {k: v for k, v in result.items() if v}
+                result["html"] = self.soup.get_text()
+                return result
+
+
+        class MediaAttachment(FromJSON):
+            def __init__(self, content):
+                super().__init__(content)
+
+            @property
+            def text_list(self):
+                if not self._c:
+                    return []
+                result = [self._c.get("description", "")]
+                result = [x if x else "" for x in result]
+                return result
+
+
+        class Poll(FromJSON):
+            def __init__(self, content):
+                super().__init__(content)
+
+            def get_list(self):
+                result = self._c.get("options", [])
+                return result if result else []
+
+            @property
+            def text_list(self):
+                if not self._c:
+                    return []
+                return [x.get("title", "") for x in self.get_list()]
+
+
+        class Post(FromJSON):
+
+            def __init__(self, content):
+                super().__init__(content)
+                if self._c:
+                    self.soup = self._c.get("content", "")
+                    self._reblog = content.get("reblog", None)
+                    if self._reblog:
+                        self._reblog = Post(self._reblog)
+                    self._poll = None
+                    if self._c.get("poll", None):
+                        self._poll = Poll(self._c["poll"])
+                    self._card = None
+                    if self._c.get("card", None):
+                        self._card = PreviewCard(self._c["card"])
+                else:
+                    self.soup = None
+                    self._reblog = None
+                    self._poll = None
+                    self._card = None
+
+            @property
+            def cw(self):
+                result = self._c.get("spoiler_text", "")
+                return result if result else ""
+
+            @property
+            def content(self):
+                return copy.deepcopy(self._c)
+
+            @property
+            def ctime(self):
+                return self._c.get("created_at", "")
+            @property
+            def id(self):
+                return str(self._c.get("id", ""))
+                
+            @property
+            def text_dict_this_layer(self):
+                if not self._c:
+                    return dict()
+
+                alts = [x.get("description", "") for x in self._c.get("media_attachments", [])]
+                alts_dict = {
+                    f"alt_{i}": MediaAttachment(m).text_only
+                    for i, m in enumerate(self._c.get("media_attachments", []))
+                }
+                acct = self._c.get("account", dict(display_name="", acct=""))
+                author = f"{acct['display_name']} [{acct['acct']}]" if acct else ""
+                result = dict(
+                    author=author,
+                    content=self.soup.get_text(),
+                    cw=self.cw,
+                    poll=self._poll.text_only if self._poll else "",
+                    card=self._card.text_only if self._card else "",
+                    **alts_dict,
+                )
+                return result
+
+            def get_reblog_chain(self):
+                reblog_chain = []
+                current_layer = self
+                while current_layer is not None:
+                    reblog_chain.append(current_layer)
+                    current_layer = current_layer._reblog
+                return reblog_chain
+
+            @property
+            def text_dict(self):
+                return {
+                    f"{i}.{f}": v for i, d in enumerate(self.get_reblog_chain()) for f, v in d.text_dict_this_layer.items()
+                }
+
+            def _inner_html_this_layer(self):
+                acct = self._c.get("account", dict(display_name="", acct=""))
+                result = self.text_dict_this_layer
+                text = []
+                text.append(f'''
+                <div class="card-header">
+                  <div class="d-flex flex-row">
+                    <div class="col-1 mx-2">
+                        <img class="img-fluid card-text" src="{self._c.get('account', {}).get('avatar_static', "")}">
+                    </div>
+                    <div class="col flex-grow-1 mx-2">
+                        <div class="row-fluid d-flex justify-content-between"><div class="col"><h5 class="card-title">{acct['display_name']}</h5></div><div class="col text-body-secondary text-end"><a href="{self._c.get('uri', '')}" target="_blank" class="text-body-secondary">{self.ctime}<i class="bi-box-arrow-up-right mx-1"></i></a></div></div>
+                        <div class="row-fluid d-flex justify-content-between"><div class="col"><h6 class="card-title"><a href="{acct['url']}" target="_blank" class="text-body-secondary">{acct['acct']}<i class="bi-box-arrow-up-right mx-1"></i></a></h6></div><div class="col text-body-secondary text-end"><p py-click="app.show_detail_modal('{self.id}', '{self.ctime}')" data-bs-toggle="modal" data-bs-target="#postDetailsModal"><i class="bi-card-text mx-1"></i><i class="bi-search mx-1"></i></p></div></div>
+                    </div>
+                  </div>
+                </div>
+                <div class="card-body">''')
+                if result['cw']:
+                    text.append(f'''
+                    <h6 class="card-subtitle mb-2 text-body-secondary"><span class="badge bg-secondary">CW</span>{result['cw']}</h6>''')
+                text.append(f'''
+                    <div class="card-text">
+                        {result['content']}
+                    </div>''')
+                if result['poll']:
+                    text.append('''
+                    <ul class="list-group list-group-flush">''')
+                    for poll in self._poll.get_list():
+                        text.append(f'''
+                        <li class="list-group-item">{poll.get("title", "")}</li>''')
+                    text.append('''
+                    </ul>
+                    ''')
+                text.append(f'''
+                </div>
+                ''')
+                if any(x.startswith('alt-') for x in result):
+                    alts = [v for k, v in result.items() if k.startswith('alt-')]
+                    text.append(f'''
+                    <div class="card-footer">''')
+                    for v in alts:
+                        if not v:
+                            continue
+                        text.append(f'''
+                        <p class="card-text"><span class="badge bg-secondary">img-alt</span> {v}</p>''')
+                    text.append('''
+                    </div> ''')
+                if result['card']:
+                    card = self._card.text_dict
+                    text.append(f'''
+                    <div class="card-footer">''')
+                    for k, v in card.items():
+                        if not v:
+                            continue
+                        if k == "html":
+                            text.append(v)
+                            continue
+                        text.append(f'''
+                        <p><span class="badge bg-secondary">{k}</span> {v}</p>''')
+                    text.append('''
+                    </div> ''')
+                return ''.join(text)
+                
+            def _repr_html_(self):
+                result = []
+                chain = self.get_reblog_chain()
+                result.append('<div class="card my-5">')
+                result.extend(
+                    x._inner_html_this_layer() for x in chain
+                )
+                result.append("</div>")
+                return "\n".join(result)
+
+
+        class PostBank():
+            def __init__(self, account_id):
+                self.account_id = account_id
+                self.load_success = False
+                self.posts = dict()
+                self.timeline = []
+                self.time_save_requested = 0
+                self._task_load = None
+                self._task_save = None
+
+            def _field_path(self, field):
+                return os.path.join(self.account_id, field)
+
+            async def wait_and_load(self, delay=10):
+                await asyncio.sleep(delay)
+                self.load()
+
+            def load(self):
+                if not Storage.ready:
+                    self.posts = self.timeline = None
+                    alert("Failed to load cached posts. Retrying in 10 seconds.\nTo preserve data, new posts cannot be saved before load success.")
+                    self._task_load = asyncio.create_task(self.wait_and_load())
+                    return
+                loaded = Storage.get(self._field_path("post_bank"), "not_yet_loaded")
+                print("post bank loading")
+                try:
+                    print(type(loaded))
+                    print(isinstance(loaded, list))
+                    print(len(loaded))
+                except Exception:
+                    pass
+                if loaded and isinstance(loaded, list) and len(loaded) == 2:
+                    posts, timeline = loaded
+                    self.posts = {k: [Post(t) for t in v] for k, v in posts.items()}
+                    # self.timeline = [tuple(x) for x in timeline]
+                    self.rebuild_timeline()
+                    self.load_success = True
+                    print("post bank loaded")
+                else:
+                    self.posts = {}
+                    self.timeline = []
+
+            def save(self):
+                if not self.load_success:
+                    return
+                Storage.set(self._field_path("post_bank"), [
+                    {k: [t._c for t in v] for k, v in self.posts.items()},
+                    self.timeline
+                ])
+
+            def rebuild_timeline(self):
+                self.timeline = sorted((p.ctime, p.id) for history in self.posts.values() for p in history)
+
+            def sort_timeline(self, check=False):
+                if check and all(b >= a for a, b in zip(self.timeline, self.timeline[1:])):
+                    return
+                self.timeline.sort()
+
+            def refresh(self):
+                self.sort_timeline(check=True)
+                self.save()
+                
+            def extend(self, posts, refresh=True):
+                for post in posts:
+                    self.append(post, refresh=False)
+                if refresh:
+                    self.refresh()
+
+            def append(self, post_, refresh=True):
+                if isinstance(post_, dict):
+                    post_ = Post(post_)
+                for post in post_.get_reblog_chain():
+                    ctime = str(post.ctime)
+                    idx = post.id
+                    if idx in self.posts:
+                        history = self.posts[idx]
+                        if any(p.ctime == ctime for p in history):
+                            continue
+                        history.append(post)
+                        history.sort(key=lambda x: x.ctime)
+                        self.timeline.append((post.ctime, post.id))
+                    else:
+                        self.posts[idx] = [post]
+                        self.timeline.append((post.ctime, post.id))
+                if refresh:
+                    self.refresh()
+
+            def assemble_timeline(self, ids):
+                return [self.posts[i][-1] for i in ids if i in self.posts]
+
+            def __getitem__(self, keys):
+                print("len(keys) = {len(keys)}")
+                if len(keys) != 2:
+                    return None
+                idx, ctime = keys
+                print(idx, self.posts.keys())
+                if idx not in self.posts:
+                    return None
+                print(ctime)
+                print([x.ctime for x in self.posts[idx]])
+                for p in self.posts[idx]:
+                    if p.ctime == ctime:
+                        return p
+                return None
+
+            def __len__(self):
+                return len(self.posts)
+
+            def search(self, term, max=200):
+                ptn = re.compile(term)
+                matches = []
+                for t, k in self.timeline[::-1]:
+                    for p in self.posts[k]:
+                        if ptn.search(p.text_only):
+                            matches.append(p)
+                    if len(matches) >= max:
+                        break
+                return matches
+
+
+        class MastodonCacher():
+            APPNAME = "painteddurian-pyscript-5"
+            MY_URL = window.location.href
+            REDIRECT_URL = str(URL.new("/auth_redirect.html", MY_URL))
+
+            def __init__(self, domain="mstdn.social", account_id="1"):
+                self.loaded = None
+                self.is_persist = None
+                self.account_id = account_id
+                self.domain = domain
+                self._task_async_setup = asyncio.create_task(self.async_setup())  # runs in background
+                self._tasks_wait_and_crawl = []
+                self.bank = PostBank(account_id)
+                self._cache_user_id = dict()
+                self.server_waiter = None
+                self.flag_crawling_break = False
+                self._timeline_crawled_since_id = None
+                old_detail_modal = Element("postDetailsModal")
+                # self.detail_modal = bootstrap.Modal.new("#postDetailsModal")
+                # old_detail_modal.element.id = "oldPostDetailsModel"
+
+            async def async_setup(self):
+                print("asking for persistent storage")
+                self.is_persist = await navigator.storage.persist()
+                print("persist: ", self.is_persist)
+                try:
+                    await asyncio.wait_for(Storage._task_setup, timeout=None)
+                    self.register_appinfo_if_nexist_setup_login()
+                    self.load()
+                except Exception as e:
+                    print(e)
+                    raise
+                self.loaded = True
+
+            def load(self):
+                self.bank.load()
+
+            def register_appinfo_if_nexist_setup_login(self):
+                if not self.is_persist:
+                    print("Persistent storage not yet granted!")
+                if not self.appinfo:
+                    print("Registering appinfo...")
+                    response = requests.post(
+                        f"https://{self.domain}/api/v1/apps",
+                        data=dict(
+                            client_name=self.APPNAME,
+                            redirect_uris="\n".join([
+                                "urn:ietf:wg:oauth:2.0:oob",
+                                self.REDIRECT_URL,
+                            ]),
+                            scopes="read",
+                            website="http://127.0.0.1",
+                        )
+                    )
+                    if response.ok:
+                        self.appinfo = response.json()
+                    else:
+                        print(response.json())
+                button = Element("login")
+                print("putting onclick")
+                button.element.setAttribute("onclick", f"window.open('{self.get_login_url()}')")
+
+            def _field_path(self, field):
+                return os.path.join(self.account_id, field)
+
+            @property
+            def spin(self):
+                return Element("top_spinner").element.style.display
+
+            @spin.setter
+            def spin(self, v):
+                Element("top_spinner").element.style.display = "block" if v else "none"
+
+            @property
+            def appinfo(self):
+                return Storage.get(self._field_path("appinfo"), {})
+
+            @appinfo.setter
+            def appinfo(self, v):
+                return Storage.set(self._field_path("appinfo"), v)
+
+            @property
+            def userinfo(self):
+                return Storage.get(self._field_path("userinfo"), {})
+
+            @userinfo.setter
+            def userinfo(self, v):
+                return Storage.set(self._field_path("userinfo"), v)
+
+            @property
+            def oauth_code(self):
+                return Storage.get(self._field_path("oauth_code"), "")
+
+            @oauth_code.setter
+            def oauth_code(self, v):
+                return Storage.set(self._field_path("oauth_code"), v)
+
+            @property
+            def token(self):
+                return Storage.get(self._field_path("token"), {})
+
+            @token.setter
+            def token(self, v):
+                return Storage.set(self._field_path("token"), v)
+
+            def print_app_state(self):
+                print(json.dumps(dict(
+                    appinfo=self.appinfo,
+                    userinfo=self.userinfo,
+                    oauth_code=self.oauth_code,
+                    token=self.token,
+                    timeline_crawled_since_id=self.timeline_crawled_since_id(),
+                    _cache_user_id=self._cache_user_id,
+                ), indent=2))
+                self.server_waiter and self.server_waiter.done() and self.server_waiter.result()
+
+            def get_login_url(self):
+                print("get_login_url called")
+                if self.userinfo:
+                    return "#"
+                appinfo = self.appinfo
+                if not appinfo:
+                    alert("App not yet registered.")
+                    return "#"
+                params = dict(
+                    response_type="code",
+                    client_id=appinfo["client_id"],
+                    redirect_uri="urn:ietf:wg:oauth:2.0:oob",
+                    # redirect_uri=urllib.parse.quote(self.REDIRECT_URL, safe=""),
+                    scope="read",
+                )
+                url = f"https://{self.domain}/oauth/authorize?" + "&".join([f"{k}={v}" for k, v in params.items()])
+                return url
+
+            def login_redirect_deprecated(self):
+                url = self.get_login_url()
+                window.location.replace(url)
+                # webbrowser.open(uri)
+                # response = requests.get(
+                #     uri,
+                # )
+                # self.userinfo = response
+                # print(response)
+
+            def reset_app(self):
+                self.appinfo = {}
+                self.userinfo = {}
+                self.oauth_code = ""
+                self.token = {}
+                self.timeline_crawled_since_id({})
+                self.print_app_state()
+
+            def timeline_crawled_since_id(self, field=None, newval=None):
+                field_path = self._field_path(f"timeline_crawled_since_id")
+                # if not loaded, lazy loading
+                if self._timeline_crawled_since_id is None:
+                    self._timeline_crawled_since_id = Storage.get(field_path, {})
+                # operation on all
+                if field is None:
+                    # getter
+                    if newval is None:
+                        return self._timeline_crawled_since_id
+                    # setter
+                    self._timeline_crawled_since_id = newval
+                    Storage.set(field_path, newval)
+                    return
+                # operation on individual field
+                # getter
+                if newval is None:
+                    return self._timeline_crawled_since_id.get(field)
+                # setter
+                self._timeline_crawled_since_id[field] = newval
+                Storage.set(field_path, self._timeline_crawled_since_id)
+
+            def input_oauth_code(self):
+                textbox = Element("oauth_code")
+                if not textbox.value:
+                    return
+                self.oauth_code = textbox.value
+                textbox.element.value = ""
+
+            def obtain_token_if_nexist(self):
+                if not self.token:
+                    appinfo = self.appinfo
+                    data = dict(
+                        grant_type="authorization_code",
+                        code=self.oauth_code,
+                        client_id=appinfo["client_id"],
+                        client_secret=appinfo["client_secret"],
+                        # redirect_uri=urllib.parse.quote(self.REDIRECT_URL, safe=""),
+                        redirect_uri="urn:ietf:wg:oauth:2.0:oob",
+                        scope="read",
+                    ) 
+                    print(json.dumps(data, indent=2))
+                    response = requests.post(
+                        f"https://{self.domain}/oauth/token",
+                        data=data,
+                    )
+                    print(response.ok)
+                    if response.ok:
+                        self.token = response.json()
+                    else:
+                        print(response.json())
+
+            def display_posts(self, posts):
+                try:
+                    posts = [x if isinstance(x, Post) else Post(x) for x in posts]
+                    timeline_el = Element("timeline")
+                    timeline_el.clear()
+                    timeline = timeline_el.element
+                    print("displaying title and posts...")
+                    display(DisplayHTMLfromHTML(f'<div class="row"><h1>Timeline <span class="text-body-tertiary" style="font-size:0.8em">displaying {len(posts)} / {len(self.bank)} posts cached</span></h1></div>'), target="timeline", append=True)
+                    # display(DisplayHTMLfromHTML('<h1>Timeline</h1><p></p>'), target="timeline", append=True)
+                    for p in posts:
+                        display(p, target="timeline", append=True)
+                except Exception as ex:
+                    traceback.print_exception(type(ex), ex, ex.__traceback__)
+
+            def extend_posts(self, posts, pagesize=40):
+                self.bank.extend(posts[::-1], refresh=False)
+                self.bank.refresh()
+                self.refresh_dropdown(pagesize=pagesize)
+
+            def refresh_dropdown(self, pagesize=40):
+                print("refreshing dropdown... ", end="")
+                dd = Element("pagesdropdown")
+                dd.clear()
+                n_pages = int(math.ceil(len(self.bank)/float(pagesize)))
+                options = [f'<option value="{x+1}">Page {x+1}</option>' for x in range(n_pages)]
+                dd.element.innerHTML = "\n".join(options)
+                print(f"{n_pages} pages posted.")
+
+            def break_crawl(self):
+                self.flag_crawling_break = True
+
+            def _crawl_timeline_post_hook(self, task, mode="home", which="", before_id=None, remaining=5):
+              try:
+                if task.cancelled():
+                    print("_get_timeline cancelled" )
+                    self.spin = False
+                    return
+                if task.exception():
+                    print(f"_get_timeline error")
+                    ex = task.exception()
+                    traceback.print_exception(type(ex), ex, ex.__traceback__)
+                    self.spin = False
+                    return
+                url_path = self.url_path_from_mode(mode, which)
+                if url_path is None:
+                    self.spin = False
+                    return False
+                posts = task.result()
+                self.update_page_on_change()
+                if not posts or posts[-1].id == before_id:
+                    self.spin = False
+                    return
+                print(f"bookkeeping: len {len(posts)}, ids {[x.id for x in posts]}")
+                self.timeline_crawled_since_id(url_path, posts[-1].id)
+                self.display_posts(posts)
+                if self.flag_crawling_break:
+                    self.flag_crawling_break = False
+                    self.spin = False
+                    return
+                wait = 1
+                print(f"crawl next, sleep {wait}s...")
+                async def _wait_and_crawl(self, mode, which, remaining, wait):
+                    await asyncio.sleep(1)
+                    self.schedule_crawl_timeline(mode=mode, which=which, remaining=remaining)
+                self._tasks_wait_and_crawl.append(asyncio.create_task(_wait_and_crawl(self, mode, which, remaining, wait)))
+                self._tasks_wait_and_crawl = [x for x in self._tasks_wait_and_crawl if x.done()]
+                
+              except Exception as ex:
+                traceback.print_exception(type(ex), ex, ex.__traceback__)
+                raise
+
+            def schedule_crawl_timeline(self, mode="home", which="", before_id=None, remaining=5, check_from_start=False):
+                from_start = Element("option_crawl_from_now").element.checked if check_from_start else False
+                if self.server_waiter and not self.server_waiter.done():
+                    return False
+                url_path = self.url_path_from_mode(mode, which)
+                if url_path is None:
+                    return False
+                if remaining == 0:
+                    self.update_page_on_change()
+                    return True
+                kwargs = dict(limit=40)
+                if before_id is None:
+                    if from_start:
+                        self.timeline_crawled_since_id(url_path, "None")
+                        Element("option_crawl_from_now").element.checked = False
+                    before_id = self.timeline_crawled_since_id(url_path)
+                if before_id is not None and before_id != "None":
+                    kwargs["max_id"] = before_id
+
+                print(f'Crawling {url_path} with max_id = "{kwargs.get("max_id", None)}" (remaining pulls: {remaining})...\n')
+                return self.schedule_get_timeline(mode=mode, which=which, post_hook=functools.partial(self._crawl_timeline_post_hook, mode=mode, which=which, before_id=before_id, remaining=remaining-1), **kwargs)
+
+            def schedule_get_timeline(self, mode="home", which="", post_hook=None, **kwargs):
+                if self.server_waiter and not self.server_waiter.done():
+                    self.spin = False
+                    return False
+                task = asyncio.ensure_future(asyncio.to_thread(self._get_timeline, mode=mode, which=which, **kwargs))
+                task.add_done_callback(post_hook)
+                self.server_waiter = task
+                return True
+
+            TIMELINE_URL = dict(
+                home="/api/v1/timelines/home",
+                profile="/api/v1/accounts/{}/statuses",
+                bookmarks="/api/v1/bookmarks",
+                favourites="/api/v1/favourites",
+            )
+
+            def url_path_from_mode(self, mode="home", which=""):
+                if mode not in self.TIMELINE_URL:
+                    return
+                if which:
+                    which = which.lstrip("@")
+                    if which in self._cache_user_id:
+                        which = self._cache_user_id[which]
+                    else:
+                        which_id = self.lookup_user_id(which.lstrip("@"))
+                        self._cache_user_id[which] = which_id
+                        which = which_id
+                return self.TIMELINE_URL[mode].format(which)
+
+            def lookup_user_id(self, handle):
+                response = requests.get(
+                    f"https://{self.domain}/api/v1/accounts/lookup",
+                    params=dict(acct=handle),
+                )
+                if not response.ok:
+                    return None
+                return response.json().get("id", None)
+                
+            def fetch_userinfo(self):
+                print("fetching userinfo... ", end="")
+                if not self.token:
+                    return
+                response = requests.get(
+                    f"https://{self.domain}/api/v1/accounts/verify_credentials",
+                    headers=dict(Authorization=f'Bearer {self.token["access_token"]}'),
+                )
+                if not response.ok:
+                    print(response.json())
+                    return
+                self.userinfo = response.json()
+                print(f"handle: @{self.userinfo['acct']}")
+                
+            def _get_timeline(self, mode="home", which="", **kwargs):
+                if not self.loaded:
+                    return []
+                url_path = self.url_path_from_mode(mode, which)
+                if url_path is None:
+                    return
+                self.obtain_token_if_nexist()
+                if not self.token:
+                    print("Token not exist")
+                    return
+                try:
+                    print(f"calling requests.get with https://{self.domain}{url_path}")
+                    self.spin = True
+                    response = requests.get(
+                        f"https://{self.domain}{url_path}",
+                        headers=dict(Authorization=f'Bearer {self.token["access_token"]}'),
+                        params=kwargs,
+                    )
+                except requests.exceptions.RequestException as e:
+                    print(e)
+                    self.spin = False
+                    raise e
+                if response.ok:
+                    timeline = [Post(x) for x in response.json()]
+                    self.extend_posts(response.json())
+                    return timeline
+                else:
+                    print(response.json())
+                    return []
+
+            def get_page(self, page=0, pagesize=40):
+                if not self.loaded:
+                    return []
+                page = int(page)
+                pagesize = int(pagesize)
+                start = max(0, page * pagesize)
+                end = (page + 1) * pagesize
+                # reverse order
+                start, end = -start, -end
+                if start == 0:
+                    start = None
+                indices = self.bank.timeline[start:end:-1]
+                return self.bank.assemble_timeline([x[1] for x in indices])
+
+            def update_page_on_change(self):
+                print(f'@when selected value {Element("pagesdropdown").value}')
+                posts = self.get_page(int(Element('pagesdropdown').value) - 1, 40)
+                self.display_posts(posts)
+                print('Displayed posts')
+
+            def search(self, *args, **kwargs):
+                return self.bank.search(*args, **kwargs)
+
+            def show_detail_modal(self, idx, ctime):
+                if not self.loaded:
+                    return
+                post = self.bank[idx, ctime]
+                if not post:
+                    return
+                text_only = post.text_only
+                Element("post_detail_content").clear()
+                for t in text_only.split("\n"):
+                    display(t, target="post_detail_content", append=True)
+                # new_modal = bootstrap.Modal.new("#postDetailsModal")
+                # new_modal.show()
+                # add_event_listener(new_modal, "hidden.bs.model", lambda *args: new_modal.dispose())
+                # new_modal.addEventListener("hidden.bs.model", create_proxy(lambda *args: new_modal.dispose()))
+                # self.detail_modal.show()
+                
+
+        app = MastodonCacher()
+        async def _display_after_load():
+            await asyncio.wait_for(app._task_async_setup, timeout=None)
+            app.display_posts(app.get_page(0, 40))
+            app.refresh_dropdown(40)
+            if app.token:
+                app.fetch_userinfo()
+            if app.userinfo:
+                Element("crawl_user").element.value = app.userinfo.get("acct", "")
+            app.spin = False
+        _task_post_load_display = asyncio.create_task(_display_after_load())
+
+        @when("change", "#pagesdropdown")
+        def _event(e):
+            print("pagesdropdown change event: ", e)
+            app.update_page_on_change()
+
+
+        def utils_toggle_terminal(value="toggle"):
+            term = Element('row-terminal').element
+            if value == "toggle":
+                value = "block" if term.style.display == 'none' else "none"
+            if value == "block":
+                term.style.display = 'block'
+                Element('terminal_toggle').element.className += " active"
+            else:
+                term.style.display = 'none'
+                Element('terminal_toggle').element.className = Element('terminal_toggle').element.className.replace(" active", "")
+
+
+        def utils_get_timeline_post_hook(x):
+            app.spin = False
+            if not x.exception() and not x.cancelled():
+                return app.display_posts(x.result())
+            else:
+                return None
+
+
+      </py-script>
+<!--
+      <button py-click="current_time()" id="get-time" class="py-button">Get current time</button>
+      <p id="current-time"></p>
+-->
+      <py-terminal id="row-terminal" style="overflow-y: scroll; height: 50vh; display: true;"></py-terminal>
+      <div class="row-fluid d-flex justify-content-center">
+        <div class="col-8 justify-content-center">
+          <div class="row my-2">
+            <h1>Controls</h1>
+          </div>
+          <div class="row justify-content-between my-2">
+            <div class="col flex-grow-1">
+              <input id="oauth_code" class="form-control">
+            </div>
+            <div class="col">
+              <div class="btn-group" role="group">
+                <button type="button" id="login" class="btn btn-primary">Login</button>
+                <button py-click="app.input_oauth_code()" class="btn btn-primary">Submit auth code</button>
+                <button type="button" py-click="app.schedule_get_timeline(limit=40, post_hook=utils_get_timeline_post_hook)" id="get-timeline" class="btn btn-primary">Get timeline</button>
+              </div>
+            </div>
+          </div>
+          <div class="row d-flex justify-content-between my-2">
+            <div class="col flex-shrink-1">
+              <!--<select class="form-select" id="pagesdropdown" py-change="[app.display_posts(app.get_page(int(Element('pagesdropdown').value) - 1, 40)), print('py-change selected value %s' % Element('pagesdropdown').value)]">-->
+              <select class="form-select" id="pagesdropdown">
+                <option value="1">Page 1</option>
+              </select>
+            </div>
+            <div class="col flex-grow-1 flex-shrink-1">
+              <input id="search_term" class="form-control">
+            </div>
+            <div class="col">
+              <div class="btn-group" role="group">
+                <button type="button" id="search" class="btn btn-primary" py-click="app.display_posts(app.search(Element('search_term').value))">Search</button>
+                <button type="button" id="crawl" class="btn btn-primary" py-click="app.schedule_crawl_timeline()">Crawl batch</button>
+                <button type="button" class="btn btn-primary dropdown-toggle dropdown-toggle-split" data-bs-toggle="dropdown" aria-expanded="false" data-bs-auto-close="outside">
+                  <span class="visually-hidden">Toggle Dropdown</span>
+                </button>
+                <ul class="dropdown-menu">
+                  <li><a class="dropdown-item">
+                    <input class="form-check-input" type="checkbox" value="" id="option_crawl_from_now">
+                    <label class="form-check-label" for="option_crawl_from_now">Start from now</label>
+                  </a></li>
+                  <li><a class="dropdown-item" py-click="app.schedule_crawl_timeline(mode='home', which='', remaining=-1, check_from_start=True)">My home timeline</a></li>
+                  <li><a class="dropdown-item" py-click="app.schedule_crawl_timeline(mode='bookmarks', which='', remaining=-1, check_from_start=True)">My bookmarks</a></li>
+                  <li><a class="dropdown-item" py-click="app.schedule_crawl_timeline(mode='favourites', which='', remaining=-1, check_from_start=True)">My favourites</a></li>
+                  <li><hr class="dropdown-divider"></li>
+                  <li><a class="dropdown-item" py-click="app.schedule_crawl_timeline(mode='profile', which=Element('crawl_user').value, remaining=-1, check_from_start=True)"><span class="col">User </span><input id="crawl_user" class="col form-control flex-shrink-0"><span class="col">'s profile</span></a></li>
+                  <li><hr class="dropdown-divider"></li>
+                  <li><a class="dropdown-item" py-click="app.break_crawl()">Stop crawling action</a></li>
+                </ul>
+              </div>
+            </div>
+          </div>
+          <div class="row justify-content-between my-2">
+            <div class="col flex-grow-1">
+              <h3>Dev Tools</h3>
+            </div>
+            <div class="col">
+              <div class="btn-group" role="group">
+                <button type="button" id="terminal_toggle" class="btn btn-outline-primary" py-click="utils_toggle_terminal()">Terminal</button>
+                <button type="button" py-click="[utils_toggle_terminal('block'), app.print_app_state()]" id="print-app-state" class="btn btn-outline-success">Get app state</button>
+                <button type="button" id="delete-app" class="btn btn-danger" data-bs-toggle="modal" data-bs-target="#deleteAppModal">DELETE APP</button>
+              </div>
+            </div>
+          </div>
+          <br/>
+        </div>
+      </div>
+      <div class="row-fluid d-flex justify-content-center">
+        <div class="spinner-border text-primary" role="status" id="top_spinner" style="display: block">
+              <span class="visually-hidden">Loading...</span>
+        </div>
+      </div>
+      <div class="row-fluid d-flex justify-content-center">
+        <div id="timeline" class="col-8 justify-content-center mx-auto">
+        </div>
+      </div>
+      <div class="modal fade" id="deleteAppModal" tabindex="-1" aria-labelledby="postDetailsModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-scrollable">
+          <div class="modal-content">
+            <div class="modal-header">
+              <h4 class="modal-title">DELETE APP</h4>
+            </div>
+            <div class="modal-body">
+                Do you really want to delete the app? You will have to login again.
+            </div>
+            <div class="modal-footer">
+              <h5>Good luck.</h5>
+              <button type="button" py-click="app.reset_app()" id="delete-app" class="btn btn-danger">DELETE APP</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal fade" id="postDetailsModal" tabindex="-1" aria-labelledby="deleteAppModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-scrollable">
+          <div class="modal-content">
+            <div class="modal-header">
+              <h4 class="modal-title">Post details</h4>
+            </div>
+            <div class="modal-body" id="post_detail_content">
+            </div>
+            <div class="modal-footer">
+            </div>
+          </div>
+        </div>
+      </div>
+    </body>
+</html>
